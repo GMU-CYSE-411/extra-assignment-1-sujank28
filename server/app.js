@@ -1,5 +1,6 @@
 const fs = require("fs");
 const path = require("path");
+const crypto = require("crypto");
 const express = require("express");
 const cookieParser = require("cookie-parser");
 const { DEFAULT_DB_FILE, openDatabase } = require("../db");
@@ -8,8 +9,27 @@ function sendPublicFile(response, fileName) {
   response.sendFile(path.join(__dirname, "..", "public", fileName));
 }
 
+// Use a random session id instead of Math.random since sessions need stronger randomness
 function createSessionId() {
-  return `SESSION-${Math.random().toString(36).slice(2, 10)}-${Date.now()}`;
+  return crypto.randomBytes(32).toString("hex");
+}
+
+// CSRF token is used for state changing requests
+function createCsrfToken() {
+  return crypto.randomBytes(32).toString("hex");
+}
+
+// Basic CSRF check. The token in the cookie must match the token sent by the browser code.
+function requireCsrf(request, response, next) {
+  const cookieToken = request.cookies.csrf;
+  const headerToken = request.get("x-csrf-token");
+
+  if (!cookieToken || !headerToken || cookieToken !== headerToken) {
+    response.status(403).json({ error: "Invalid CSRF token." });
+    return;
+  }
+
+  next();
 }
 
 async function createApp() {
@@ -28,6 +48,7 @@ async function createApp() {
   app.use("/css", express.static(path.join(__dirname, "..", "public", "css")));
   app.use("/js", express.static(path.join(__dirname, "..", "public", "js")));
 
+  // Load the current user from the session cookie on each request
   app.use(async (request, response, next) => {
     const sessionId = request.cookies.sid;
 
@@ -81,26 +102,34 @@ async function createApp() {
   app.get("/admin", (_request, response) => sendPublicFile(response, "admin.html"));
 
   app.get("/api/me", (request, response) => {
-    response.json({ user: request.currentUser });
+    response.json({
+      user: request.currentUser,
+      csrfToken: request.cookies.csrf || null
+    });
   });
 
   app.post("/api/login", async (request, response) => {
     const username = String(request.body.username || "");
     const password = String(request.body.password || "");
 
-    const query = `
-      SELECT id, username, role, display_name
-      FROM users
-      WHERE username = '${username}' AND password = '${password}'
-    `;
-    const user = await db.get(query);
+    // Parameterized query keeps user input as data, not SQL code
+    const user = await db.get(
+      `
+        SELECT id, username, role, display_name
+        FROM users
+        WHERE username = ? AND password = ?
+      `,
+      [username, password]
+    );
 
     if (!user) {
       response.status(401).json({ error: "Invalid username or password." });
       return;
     }
 
-    const sessionId = request.cookies.sid || createSessionId();
+    // Regenerate session id after login instead of reusing an old cookie value
+    const sessionId = createSessionId();
+    const csrfToken = createCsrfToken();
 
     await db.run("DELETE FROM sessions WHERE id = ?", [sessionId]);
     await db.run(
@@ -109,7 +138,14 @@ async function createApp() {
     );
 
     response.cookie("sid", sessionId, {
-      path: "/"
+      path: "/",
+      httpOnly: true,
+      sameSite: "lax"
+    });
+
+    response.cookie("csrf", csrfToken, {
+      path: "/",
+      sameSite: "lax"
     });
 
     response.json({
@@ -119,7 +155,8 @@ async function createApp() {
         username: user.username,
         role: user.role,
         displayName: user.display_name
-      }
+      },
+      csrfToken
     });
   });
 
@@ -129,34 +166,41 @@ async function createApp() {
     }
 
     response.clearCookie("sid");
+    response.clearCookie("csrf");
     response.json({ ok: true });
   });
 
   app.get("/api/notes", requireAuth, async (request, response) => {
-    const ownerId = request.query.ownerId || request.currentUser.id;
-    const search = request.query.search || "";
+    // Do not trust ownerId from the client. Use the logged-in user instead.
+    const ownerId = request.currentUser.id;
+    const search = String(request.query.search || "");
+    const likeSearch = `%${search}%`;
 
-    const notes = await db.all(`
-      SELECT
-        notes.id,
-        notes.owner_id AS ownerId,
-        users.username AS ownerUsername,
-        notes.title,
-        notes.body,
-        notes.pinned,
-        notes.created_at AS createdAt
-      FROM notes
-      JOIN users ON users.id = notes.owner_id
-      WHERE notes.owner_id = ${ownerId}
-        AND (notes.title LIKE '%${search}%' OR notes.body LIKE '%${search}%')
-      ORDER BY notes.pinned DESC, notes.id DESC
-    `);
+    const notes = await db.all(
+      `
+        SELECT
+          notes.id,
+          notes.owner_id AS ownerId,
+          users.username AS ownerUsername,
+          notes.title,
+          notes.body,
+          notes.pinned,
+          notes.created_at AS createdAt
+        FROM notes
+        JOIN users ON users.id = notes.owner_id
+        WHERE notes.owner_id = ?
+          AND (notes.title LIKE ? OR notes.body LIKE ?)
+        ORDER BY notes.pinned DESC, notes.id DESC
+      `,
+      [ownerId, likeSearch, likeSearch]
+    );
 
     response.json({ notes });
   });
 
-  app.post("/api/notes", requireAuth, async (request, response) => {
-    const ownerId = Number(request.body.ownerId || request.currentUser.id);
+  app.post("/api/notes", requireAuth, requireCsrf, async (request, response) => {
+    // The server decides who owns the note, not the browser request body
+    const ownerId = request.currentUser.id;
     const title = String(request.body.title || "");
     const body = String(request.body.body || "");
     const pinned = request.body.pinned ? 1 : 0;
@@ -173,7 +217,8 @@ async function createApp() {
   });
 
   app.get("/api/settings", requireAuth, async (request, response) => {
-    const userId = Number(request.query.userId || request.currentUser.id);
+    // Users should only read their own settings
+    const userId = request.currentUser.id;
 
     const settings = await db.get(
       `
@@ -195,8 +240,9 @@ async function createApp() {
     response.json({ settings });
   });
 
-  app.post("/api/settings", requireAuth, async (request, response) => {
-    const userId = Number(request.body.userId || request.currentUser.id);
+  app.post("/api/settings", requireAuth, requireCsrf, async (request, response) => {
+    // User id comes from the session so another user cannot update someone else's profile
+    const userId = request.currentUser.id;
     const displayName = String(request.body.displayName || "");
     const statusMessage = String(request.body.statusMessage || "");
     const theme = String(request.body.theme || "classic");
@@ -211,8 +257,9 @@ async function createApp() {
     response.json({ ok: true });
   });
 
-  app.get("/api/settings/toggle-email", requireAuth, async (request, response) => {
-    const enabled = request.query.enabled === "1" ? 1 : 0;
+  app.post("/api/settings/toggle-email", requireAuth, requireCsrf, async (request, response) => {
+    // This changes state, so it should not be a GET route
+    const enabled = request.body.enabled === "1" || request.body.enabled === true ? 1 : 0;
 
     await db.run("UPDATE settings SET email_opt_in = ? WHERE user_id = ?", [
       enabled,
@@ -226,7 +273,13 @@ async function createApp() {
     });
   });
 
-  app.get("/api/admin/users", requireAuth, async (_request, response) => {
+  app.get("/api/admin/users", requireAuth, async (request, response) => {
+    // Authentication is not enough here. Only admins should access this data.
+    if (request.currentUser.role !== "admin") {
+      response.status(403).json({ error: "Admin access required." });
+      return;
+    }
+
     const users = await db.all(`
       SELECT
         users.id,
